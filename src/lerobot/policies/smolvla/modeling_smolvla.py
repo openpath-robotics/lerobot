@@ -631,7 +631,7 @@ class VLAFlowMatching(nn.Module):
     def sample_time(self, bsize, device):
         beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        time = time_beta * 0.999 + 0.001
+        time = time_beta * 0.999 + 0.001 # t ∈ (0,1]
         return time
 
     def embed_prefix(
