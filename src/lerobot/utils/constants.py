@@ -21,6 +21,8 @@ OBS_STR = "observation"
 OBS_PREFIX = OBS_STR + "."
 OBS_ENV_STATE = OBS_STR + ".environment_state"
 OBS_STATE = OBS_STR + ".state"
+# TODO(wrench): wrench key for force/torque sensor data (observation.wrench)
+OBS_WRENCH = OBS_STR + ".wrench"
 OBS_IMAGE = OBS_STR + ".image"
 OBS_IMAGES = OBS_IMAGE + "s"
 OBS_LANGUAGE = OBS_STR + ".language"

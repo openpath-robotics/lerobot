@@ -60,7 +60,8 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+# TODO(wrench): OBS_WRENCH added for force/torque sensor token
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE, OBS_WRENCH
 from lerobot.utils.device_utils import get_safe_dtype
 from lerobot.utils.import_utils import require_package
 
@@ -287,11 +288,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
+        # TODO(wrench): prepare wrench token for inference
+        wrench = self.prepare_wrench(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images, img_masks, lang_tokens, lang_masks, state, wrench=wrench, noise=noise, **kwargs
         )
 
         # Unpad actions
@@ -374,12 +377,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
+        # TODO(wrench): prepare wrench token for training
+        wrench = self.prepare_wrench(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, wrench, actions, noise, time)
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -487,6 +492,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
         state = pad_vector(state, self.config.max_state_dim)
         return state
 
+    # TODO(wrench): extracts observation.wrench (force/torque, 12-dim) from batch and pads to max_wrench_dim
+    def prepare_wrench(self, batch):
+        """Pad wrench (force/torque sensor data). Returns None if not present in batch."""
+        if OBS_WRENCH not in batch:
+            if not getattr(self, '_wrench_logged', False):
+                print("[SmolVLA] wrench input: NONE (no-force mode)")
+                self._wrench_logged = True
+            return None
+        if not getattr(self, '_wrench_logged', False):
+            print("[SmolVLA] wrench input: ACTIVE (force mode)")
+            self._wrench_logged = True
+        wrench = batch[OBS_WRENCH][:, -1, :] if batch[OBS_WRENCH].ndim > 2 else batch[OBS_WRENCH]
+        wrench = pad_vector(wrench, self.config.max_wrench_dim)
+        return wrench
+
     def prepare_action(self, batch):
         """Pad action"""
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
@@ -583,6 +603,11 @@ class VLAFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
+        # TODO(wrench): projects padded wrench vector (max_wrench_dim) to VLM hidden_size,
+        # producing one additional prefix token placed after the state token
+        self.wrench_proj = nn.Linear(
+            self.config.max_wrench_dim, self.vlm_with_expert.config.text_config.hidden_size
+        )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
 
@@ -617,6 +642,9 @@ class VLAFlowMatching(nn.Module):
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+        # TODO(wrench): wrench_proj is always trained (same policy as state_proj default)
+        for params in self.wrench_proj.parameters():
+            params.requires_grad = self.config.train_state_proj
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -635,7 +663,14 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        # TODO(wrench): wrench tensor (B, max_wrench_dim) added as a separate prefix token after state
+        wrench: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -713,6 +748,17 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
+
+        # TODO(wrench): project wrench → 1 prefix token placed right after state.
+        # att_mask=1 keeps VLM layers from attending to it (same isolation as state token).
+        # wrench=None means no-force model: skip the wrench token entirely.
+        if wrench is not None:
+            wrench_emb = self.wrench_proj(wrench)
+            wrench_emb = wrench_emb[:, None, :]  # (B, 1, hidden_size)
+            embs.append(wrench_emb)
+            wrench_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+            pad_masks.append(wrench_mask)
+            att_masks += [1]
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -772,7 +818,17 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        # TODO(wrench): wrench tensor passed through to embed_prefix
+        wrench,
+        actions,
+        noise=None,
+        time=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -785,7 +841,7 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, wrench=wrench
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -816,6 +872,8 @@ class VLAFlowMatching(nn.Module):
         lang_tokens,
         lang_masks,
         state,
+        # TODO(wrench): wrench tensor passed through to embed_prefix at inference time
+        wrench=None,
         noise=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
@@ -828,7 +886,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, wrench=wrench
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

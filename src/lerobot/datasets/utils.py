@@ -144,8 +144,8 @@ class DatasetInfo:
             raise ValueError(f"chunks_size must be positive, got {self.chunks_size}")
         if self.data_files_size_in_mb <= 0:
             raise ValueError(f"data_files_size_in_mb must be positive, got {self.data_files_size_in_mb}")
-        if self.video_files_size_in_mb <= 0:
-            raise ValueError(f"video_files_size_in_mb must be positive, got {self.video_files_size_in_mb}")
+        if self.video_files_size_in_mb < 0:
+            raise ValueError(f"video_files_size_in_mb must be non-negative, got {self.video_files_size_in_mb}")
 
     def to_dict(self) -> dict:
         """Return a JSON-serialisable dict.

@@ -40,6 +40,8 @@ class SmolVLAConfig(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
+    # TODO(wrench): max dim for force/torque wrench input (observation.wrench is 12-dim, padded to 16)
+    max_wrench_dim: int = 16
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -69,6 +71,10 @@ class SmolVLAConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
     train_state_proj: bool = True
+
+    # Backward-compat: older checkpoints saved these field names
+    wrench_dim: int | None = None        # old name; 0 means wrench was disabled at training
+    train_wrench_proj: bool | None = None  # old name, superseded by train_state_proj
 
     # Training presets
     optimizer_lr: float = 1e-4
