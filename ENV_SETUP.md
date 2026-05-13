@@ -35,7 +35,6 @@ uv --version
 conda 환경 불필요. Python 3.12를 uv가 직접 관리:
 
 ```bash
-cd ~/lerobot
 uv venv --prompt smolVLA --python 3.12
 uv sync --locked --extra all
 ```
@@ -52,6 +51,9 @@ viewer 스크립트 사용을 위해 GUI 버전으로 교체:
 uv pip uninstall opencv-python-headless
 uv pip install opencv-python
 ```
+
+> **주의**: `uv run` 또는 `uv sync` 실행 시 lock 파일 기준으로 auto-sync되어 headless가 다시 설치됨.  
+> 이 경우 위 명령어 다시 실행. **평소에는 `uv run` 대신 `.venv/bin/python`으로 직접 실행할 것.**
 
 ### 5. 추가 패키지 설치
 
@@ -80,13 +82,14 @@ uv pip install osmc-1.1.0-cp312-cp312-linux_x86_64.whl
 
 ## 실행 방법
 
-### uv run 사용 (권장)
+### .venv/bin/python 직접 실행 (권장)
 
 ```bash
-cd ~/lerobot
-uv run python script.py
-uv run lerobot-train ...
+/home/youngwoo/lerobot/.venv/bin/python script.py
 ```
+
+> `uv run python script.py`는 실행 전 auto-sync가 발생하여 수동 설치 패키지(openarm_can, osmc 등)가 삭제될 수 있음. **사용 금지.**  
+> `uv pip install`은 sync 없이 설치만 하므로 안전.
 
 ### VSCode에서 실행
 
@@ -94,7 +97,7 @@ uv run lerobot-train ...
 
 1. `Ctrl+Shift+P` → `Python: Select Interpreter`
 2. `Enter interpreter path` 클릭
-3. `/home/youngwoo/lerobot/.venv/bin/python` 입력
+3. `/path/to/your/lerobot/.venv/bin/python` 입력
 
 ### 추가 패키지 설치 시
 
