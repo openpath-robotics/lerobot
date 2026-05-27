@@ -20,7 +20,6 @@ from lerobot.utils.constants import OBS_IMAGES
 
 from ..rtc.configuration_rtc import RTCConfig
 
-
 @PreTrainedConfig.register_subclass("smolvla")
 @dataclass
 class SmolVLAConfig(PreTrainedConfig):
@@ -36,7 +35,6 @@ class SmolVLAConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
-
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
