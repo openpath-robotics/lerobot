@@ -142,6 +142,11 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+        # [ATTN-VIZ] Opt-in capture of softmax attention probabilities for visualization.
+        # None (default) = disabled, zero overhead. Set to an empty list before a forward
+        # pass to collect one (B, heads, q_len, k_len) tensor per attention call, in call
+        # order. Used by scripts/visualize_smolvla_attention.py. Reset to None when done.
+        self.attn_capture: list | None = None
         self.set_requires_grad()
 
     def get_vlm_model(self):
@@ -550,6 +555,10 @@ class SmolVLMWithExpertModel(nn.Module):
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
+        # [ATTN-VIZ] Capture attention probabilities (B, heads, q_len, k_len) when enabled.
+        # Callers distinguish VLM-prefix vs expert calls by q_len/k_len shapes.
+        if self.attn_capture is not None:
+            self.attn_capture.append(probs.detach().to("cpu", dtype=torch.float32))
         probs = probs.to(dtype=value_states.dtype)
 
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
