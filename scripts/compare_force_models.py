@@ -57,7 +57,10 @@ def parse_args():
     p.add_argument("--force-checkpoint", type=Path, required=True)
     p.add_argument("--noforce-checkpoint", type=Path, required=True)
     p.add_argument("--hdf5", type=Path, required=True, help="Raw HDF5 episode to analyze")
-    p.add_argument("--hdf5-camera", type=str, default="cam_wrist_left")
+    p.add_argument("--hdf5-cameras", type=str, default="cam_wrist_left",
+                   help="Comma-separated HDF5 image keys in camera1,camera2,... order")
+    p.add_argument("--hdf5-wrench", type=str, default="f_ext_L",
+                   help="Comma-separated HDF5 keys concatenated into observation.wrench")
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--seed", type=int, default=0, help="Shared flow-matching noise seed for both models")
     p.add_argument("--task", type=str, default="open gripper when human hand applies sufficient force")
@@ -99,7 +102,9 @@ def main():
     print("Loading no-force model ...")
     n_policy, n_pre, n_post = load_model(args.noforce_checkpoint.resolve(), args.device)
 
-    dataset = HDF5Episode(args.hdf5, args.hdf5_camera, task=args.task)
+    cameras = [c.strip() for c in args.hdf5_cameras.split(",")]
+    wrench_keys = [w.strip() for w in args.hdf5_wrench.split(",")]
+    dataset = HDF5Episode(args.hdf5, cameras, task=args.task, wrench_keys=wrench_keys)
     frames = list(range(0, dataset.num_frames, args.stride))
     action_dim = dataset[0]["action"].shape[0]
     print(f"{dataset.num_frames} frames, analyzing {len(frames)} (stride {args.stride})")

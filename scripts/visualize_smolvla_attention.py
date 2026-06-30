@@ -87,8 +87,15 @@ def parse_args():
         "When set, --episode/--repo-id/--dataset-root are ignored.",
     )
     parser.add_argument(
-        "--hdf5-camera", type=str, default="cam_wrist_left",
-        help="Which HDF5 images/<name> maps to observation.images.camera1 (default: cam_wrist_left)",
+        "--hdf5-cameras", type=str, default="cam_wrist_left",
+        help="Comma-separated HDF5 image keys in camera1,camera2,... order. "
+        "e.g. for 4cam buffing: 'cam_top,cam_wrist_left,cam_wrist_right,cam_bottom'. "
+        "Default: 'cam_wrist_left' (single-cam force_test).",
+    )
+    parser.add_argument(
+        "--hdf5-wrench", type=str, default="f_ext_L",
+        help="Comma-separated HDF5 keys concatenated into observation.wrench "
+        "(e.g. 'f_ext_L,f_ext_R' for dual-arm 12D). Ignored if the model has no wrench input.",
     )
     parser.add_argument("--episode", type=int, default=0, help="Episode index")
     parser.add_argument("--frame", type=int, default=0, help="Frame index within the episode (single-frame mode)")
@@ -102,7 +109,8 @@ def parse_args():
         default=None,
         help="Causal check: run a second inference with this input replaced by 'no information' "
         "(zeros in normalized space = dataset mean) and report how much the actions change. "
-        "Targets: 'wrench', 'state', or a camera name like 'camera1' (blacked out). "
+        "Targets: 'wrench', 'state', a camera name like 'camera1' (blacked out), or 'qref' "
+        "(for state=[q_pos,q_ref] models: set q_ref:=q_pos so the tracking-error gap vanishes). "
         "Both inferences share the same flow-matching start noise (--seed) so the action "
         "difference is caused only by the ablated input.",
     )
@@ -141,32 +149,42 @@ def load_dataset_info_from_train_config(checkpoint: Path) -> tuple[str | None, s
 
 class HDF5Episode:
     """Minimal LeRobotDataset-like view over one raw HDF5 episode file, so build_batch and
-    the rest of the pipeline work unchanged. Maps:
-      images/<hdf5_camera> -> observation.images.camera1  (JPEG decoded -> CHW float [0,1])
-      q_pos                -> observation.state
-      f_ext_L              -> observation.wrench
-      action               -> action (ground truth, for reference)
+    the rest of the pipeline work unchanged.
+
+    Args:
+      cameras:     ordered list of HDF5 image keys; cameras[k] -> observation.images.camera{k+1}.
+      wrench_keys: HDF5 keys concatenated (in order) into observation.wrench (e.g. ['f_ext_L','f_ext_R']).
+      state_mode:  'qpos'           -> observation.state = q_pos
+                   'qpos_prevaction'-> observation.state = [q_pos, previous action]  (mindgap/q_ref models,
+                                       where the second half is the previous reference command = action[t-1]).
+    Handles both raw uint8 image arrays (H,W,3) and JPEG-encoded byte blobs.
     """
 
-    def __init__(self, path: Path, camera: str, task: str, fps: int = 30):
+    def __init__(self, path: Path, cameras: list[str], task: str, wrench_keys: list[str],
+                 state_mode: str = "qpos", fps: int = 30):
         import h5py
 
         self._f = h5py.File(str(path), "r")
-        self._cam_key = f"images/{camera}"
-        assert self._cam_key in self._f, (
-            f"camera '{camera}' not in HDF5 (available: {list(self._f['images'].keys())})"
-        )
+        self._cam_keys = [f"images/{c}" for c in cameras]
+        for k in self._cam_keys:
+            assert k in self._f, f"camera '{k}' not in HDF5 (available: {list(self._f['images'].keys())})"
+        self._wrench_keys = [w for w in wrench_keys if w in self._f]
+        self._state_mode = state_mode
         self.num_frames = self._f["action"].shape[0]
         self.fps = fps
         self.task = task
 
     def _decode_img(self, raw) -> torch.Tensor:
-        import io
+        arr = np.asarray(raw)
+        if arr.ndim == 3 and arr.dtype == np.uint8:  # raw HxWx3 frame
+            arr = arr.astype(np.float32) / 255.0
+        else:  # JPEG/PNG-encoded byte blob
+            import io
 
-        from PIL import Image
+            from PIL import Image
 
-        b = raw.tobytes() if hasattr(raw, "tobytes") else bytes(raw)
-        arr = np.asarray(Image.open(io.BytesIO(b)).convert("RGB"), dtype=np.float32) / 255.0
+            b = raw.tobytes() if hasattr(raw, "tobytes") else bytes(raw)
+            arr = np.asarray(Image.open(io.BytesIO(b)).convert("RGB"), dtype=np.float32) / 255.0
         return torch.from_numpy(arr).permute(2, 0, 1)  # HWC -> CHW, [0,1]
 
     def __len__(self):
@@ -174,13 +192,20 @@ class HDF5Episode:
 
     def __getitem__(self, i: int) -> dict:
         f = self._f
-        return {
-            "observation.images.camera1": self._decode_img(f[self._cam_key][i]),
-            "observation.state": torch.from_numpy(f["q_pos"][i].astype(np.float32)),
-            "observation.wrench": torch.from_numpy(f["f_ext_L"][i].astype(np.float32)),
-            "action": torch.from_numpy(f["action"][i].astype(np.float32)),
-            "task": self.task,
-        }
+        item = {f"observation.images.camera{k + 1}": self._decode_img(f[ck][i]) for k, ck in enumerate(self._cam_keys)}
+        q_pos = f["q_pos"][i].astype(np.float32)
+        if self._state_mode == "qpos_prevaction":
+            prev = f["action"][max(i - 1, 0)].astype(np.float32)  # previous reference (action[t-1])
+            state = np.concatenate([q_pos, prev])
+        else:
+            state = q_pos
+        item["observation.state"] = torch.from_numpy(state)
+        if self._wrench_keys:
+            wrench = np.concatenate([f[w][i].astype(np.float32) for w in self._wrench_keys])
+            item["observation.wrench"] = torch.from_numpy(wrench)
+        item["action"] = torch.from_numpy(f["action"][i].astype(np.float32))
+        item["task"] = self.task
+        return item
 
 
 def build_batch(
@@ -246,6 +271,16 @@ def analyze_frame(
     raw_images = {k: batch[k].clone() for k in camera_keys}  # keep [0,1] images for overlays
     wrench_raw = batch[OBS_WRENCH][0].clone() if OBS_WRENCH in batch else None
 
+    # 'qref' ablation works in RAW space: state = [q_pos, q_ref]; set q_ref := q_pos so the
+    # tracking-error gap (the implicit force signal) vanishes. Built before normalization.
+    ablated_batch = None
+    if ablate == "qref":
+        raw_ab = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+        st = raw_ab[OBS_STATE]
+        half = st.shape[-1] // 2
+        st[..., half:] = st[..., :half]  # q_ref := q_pos  -> zero gap
+        ablated_batch = preprocessor(raw_ab)
+
     batch = preprocessor(batch)
 
     vwe = policy.model.vlm_with_expert
@@ -263,8 +298,9 @@ def analyze_frame(
     ablation = None
     if ablate is not None:
         assert noise is not None, "ablation needs a fixed noise tensor"
+        ab_batch = ablated_batch if ablate == "qref" else ablate_batch_key(batch, ablate)
         with torch.no_grad():
-            actions_ablated = policy.predict_action_chunk(ablate_batch_key(batch, ablate), noise=noise)
+            actions_ablated = policy.predict_action_chunk(ab_batch, noise=noise)
         a, b = actions, actions_ablated
         if postprocessor is not None:  # compare in unnormalized (robot) units
             a, b = postprocessor(a), postprocessor(b)
@@ -742,9 +778,26 @@ def main():
         print(f"Ablation target: '{args.ablate}' (seed={args.seed})")
 
     if args.hdf5:
-        task = args.task if args.task is not None else "open gripper when human hand applies sufficient force"
-        print(f"Loading HDF5 episode {args.hdf5} (camera '{args.hdf5_camera}' -> camera1)")
-        dataset = HDF5Episode(args.hdf5, args.hdf5_camera, task=task)
+        # SmolVLA is language-conditioned, so the task string matters. HDF5 has no task field;
+        # pass --task with the EXACT training instruction (see meta/tasks.parquet of the train set).
+        if args.task is None:
+            print("WARNING: no --task given for HDF5; using ''. Pass the model's training task "
+                  "(e.g. 'buffing the midsole') or the policy will be mis-conditioned.")
+        task = args.task if args.task is not None else ""
+        cameras = [c.strip() for c in args.hdf5_cameras.split(",")]
+        wrench_keys = [w.strip() for w in args.hdf5_wrench.split(",")]
+        # Auto-detect state layout: if the model wants 2x the HDF5 q_pos dim, it's a
+        # [q_pos, prev_action] (mindgap/q_ref) model; otherwise plain q_pos.
+        import h5py
+
+        with h5py.File(str(args.hdf5), "r") as _hf:
+            qpos_dim = _hf["q_pos"].shape[1]
+        model_state_dim = policy.config.input_features["observation.state"].shape[0]
+        state_mode = "qpos_prevaction" if model_state_dim == 2 * qpos_dim else "qpos"
+        print(f"Loading HDF5 episode {args.hdf5}")
+        print(f"  cameras {cameras} -> camera1..{len(cameras)} | state_mode={state_mode} "
+              f"(model state {model_state_dim}, q_pos {qpos_dim}) | wrench {wrench_keys}")
+        dataset = HDF5Episode(args.hdf5, cameras, task=task, wrench_keys=wrench_keys, state_mode=state_mode)
         print(f"  {dataset.num_frames} frames | task: '{task}'")
     else:
         print(f"Loading dataset {repo_id} (root={root}), episode {args.episode}")
